@@ -19,7 +19,7 @@ use crate::sim::{Diff, EnemyState, PlayerState, Sim, K_A, K_D, K_S, K_W};
 use crate::world::{Theme, Weather, WORLDS, World};
 
 const SPD: f64 = 4.0;
-const RSPD: f64 = 2.8;
+const RSPD: f64 = 1.4;
 const HOLD_MS: u128 = 200;
 
 // ---------------------------------------------------------------------------
