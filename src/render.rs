@@ -2,6 +2,7 @@ use ratatui::style::{Color, Style};
 use ratatui::text::Span;
 
 use crate::camera::Cam;
+use crate::sim::{EnemyState, PlayerState};
 use crate::world::{I_GLASS, Palette, Weather, World};
 
 pub fn cl(v: f64) -> u8 {
@@ -42,6 +43,10 @@ fn sky_weather(c: (f64, f64, f64), weather: Weather) -> (f64, f64, f64) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// main scene
+// ---------------------------------------------------------------------------
+
 pub fn render_scene(
     buf: &mut [u8],
     rw: usize,
@@ -51,10 +56,15 @@ pub fn render_scene(
     pal: &Palette,
     weather: Weather,
     frame: u64,
+    players: &[PlayerState],
+    enemies: &[EnemyState],
+    self_id: usize,
+    flash: f32,
 ) {
     for b in buf.iter_mut() {
         *b = 0;
     }
+    let mut depth = vec![9999.0f32; rw * rh];
     let hw = (rh as f64) * 0.5;
     let proj = hw;
 
@@ -166,6 +176,7 @@ pub fn render_scene(
             buf[idx] = cl(r);
             buf[idx + 1] = cl(g);
             buf[idx + 2] = cl(b);
+            depth[dy * rw + sx] = 1000.0;
         }
 
         // WALL
@@ -203,6 +214,7 @@ pub fn render_scene(
                 buf[idx] = cl(r);
                 buf[idx + 1] = cl(g);
                 buf[idx + 2] = cl(b);
+                depth[dy * rw + sx] = wd as f32;
             }
         }
 
@@ -219,6 +231,7 @@ pub fn render_scene(
             buf[idx] = cl(r);
             buf[idx + 1] = cl(g);
             buf[idx + 2] = cl(b);
+            depth[dy * rw + sx] = rowdist as f32;
         }
     }
 
@@ -244,9 +257,252 @@ pub fn render_scene(
             }
         }
     }
+
+    // sprites (enemies + other players), far first
+    draw_sprites(buf, rw, rh, &mut depth, cam, players, enemies, self_id);
+
+    // gun viewmodel + crosshair on top
+    draw_crosshair(buf, rw, rh, flash);
+    draw_gun(buf, rw, rh, flash);
 }
 
-pub fn draw_minimap(buf: &mut [u8], rw: usize, cam: &Cam, w: &World) {
+// ---------------------------------------------------------------------------
+// sprites
+// ---------------------------------------------------------------------------
+
+struct Sprite {
+    x: f64,
+    y: f64,
+    dist: f64,
+    friend: bool,
+}
+
+fn draw_sprites(
+    buf: &mut [u8],
+    rw: usize,
+    rh: usize,
+    depth: &mut [f32],
+    cam: &Cam,
+    players: &[PlayerState],
+    enemies: &[EnemyState],
+    self_id: usize,
+) {
+    let mut sprites: Vec<Sprite> = Vec::new();
+    for (i, p) in players.iter().enumerate() {
+        if i == self_id {
+            continue;
+        }
+        sprites.push(Sprite {
+            x: p.x,
+            y: p.y,
+            dist: (p.x - cam.x).powi(2) + (p.y - cam.y).powi(2),
+            friend: true,
+        });
+    }
+    for e in enemies {
+        if !e.alive {
+            continue;
+        }
+        sprites.push(Sprite {
+            x: e.x,
+            y: e.y,
+            dist: (e.x - cam.x).powi(2) + (e.y - cam.y).powi(2),
+            friend: false,
+        });
+    }
+    sprites.sort_by(|a, b| b.dist.partial_cmp(&a.dist).unwrap_or(std::cmp::Ordering::Equal));
+
+    let hw_px = rw as f64 / 2.0;
+    let hw_row = rh as f64 / 2.0;
+
+    for sp in &sprites {
+        let rx = sp.x - cam.x;
+        let ry = sp.y - cam.y;
+        let t = rx * cam.dx + ry * cam.dy;
+        if t < 0.3 {
+            continue;
+        }
+        let l = rx * cam.px + ry * cam.py;
+        let cx = l / t;
+        let sx_c = (cx + 1.0) * hw_px;
+        let half_w = (0.36 * hw_px / t).max(0.6);
+        let x0 = (sx_c - half_w).floor() as i64;
+        let x1 = (sx_c + half_w).ceil() as i64;
+
+        let head = cam.z - 1.85;
+        let y_top = hw_row + (head / t) * hw_row;
+        let y_bot = hw_row + (cam.z / t) * hw_row;
+        let y0 = y_top.max(0.0) as i64;
+        let y1 = y_bot.min(rh as f64 - 1.0) as i64;
+        if x1 < 0 || x0 >= rw as i64 || y1 < y0 {
+            continue;
+        }
+
+        let midset = 0.55;
+        let body: (u8, u8, u8) = if sp.friend {
+            (70, 140, 230)
+        } else {
+            (210, 45, 45)
+        };
+        let dark: (u8, u8, u8) = if sp.friend {
+            (35, 85, 150)
+        } else {
+            (120, 22, 22)
+        };
+        let headc: (u8, u8, u8) = if sp.friend {
+            (150, 205, 255)
+        } else {
+            (255, 190, 110)
+        };
+
+        for sy in y0..=y1 {
+            let fy = (sy as f64 - y_top) / (y_bot - y_top).max(0.001);
+            let (r, g, b) = if fy < 0.16 {
+                headc
+            } else if fy < midset {
+                body
+            } else {
+                dark
+            };
+            for sx in x0..=x1 {
+                if sx < 0 || sx >= rw as i64 || sy < 0 || sy >= rh as i64 {
+                    continue;
+                }
+                let pi = (sy as usize) * rw + (sx as usize);
+                let t2 = t as f32;
+                if t2 >= depth[pi] {
+                    continue;
+                }
+                let idx = pi * 3;
+                buf[idx] = r;
+                buf[idx + 1] = g;
+                buf[idx + 2] = b;
+                depth[pi] = t2;
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// gun + crosshair
+// ---------------------------------------------------------------------------
+
+fn draw_crosshair(buf: &mut [u8], rw: usize, rh: usize, _flash: f32) {
+    let cx = rw as i64 / 2;
+    let cy = rh as i64 / 2;
+    for (dx, dy, r, g, b) in [
+        (-2, 0, 0, 255, 220),
+        (2, 0, 0, 255, 220),
+        (0, -2, 0, 255, 220),
+        (0, 2, 0, 255, 220),
+        (-1, 0, 40, 200, 160),
+        (1, 0, 40, 200, 160),
+        (0, -1, 40, 200, 160),
+        (0, 1, 40, 200, 160),
+        (0, 0, 0, 255, 255),
+    ] {
+        let sx = cx + dx;
+        let sy = cy + dy;
+        if sx < 0 || sy < 0 || sx >= rw as i64 || sy >= rh as i64 {
+            continue;
+        }
+        let idx = (sy as usize * rw + sx as usize) * 3;
+        buf[idx] = r;
+        buf[idx + 1] = g;
+        buf[idx + 2] = b;
+    }
+}
+
+fn draw_gun(buf: &mut [u8], rw: usize, rh: usize, flash: f32) {
+    let gw = 13i64;
+    let gh = 26i64;
+    let gx0 = (rw as i64 / 2) - gw / 2;
+    let gy0 = (rh as i64 - gh).max(0);
+    let gx1 = gx0 + gw - 1;
+    let gy1 = rh as i64 - 1;
+
+    for sy in gy0..=gy1 {
+        for sx in gx0..=gx1 {
+            let idx = (sy as usize * rw + sx as usize) * 3;
+            // slide (top, narrow)
+            let in_slide = sx >= gx0 + 3 && sx <= gx0 + gw - 4 && sy <= gy0 + 8;
+            // receiver / grip
+            let inset = if sy >= gy1 - 9 { 3 } else { 1 };
+            let in_body = !in_slide && sx >= gx0 + inset && sx <= gx1 - inset && sy > gy0 + 6;
+            let (r, g, b): (u8, u8, u8) = if in_slide {
+                if sy == gy0 {
+                    (140, 122, 96)
+                } else if sy == gy0 + 1 {
+                    (110, 98, 82)
+                } else {
+                    (64, 58, 52)
+                }
+            } else if in_body {
+                let edge = sx < gx0 + inset + 2 || sx > gx1 - inset - 2;
+                if edge {
+                    (44, 38, 34)
+                } else if (sy - gy0) % 4 == 2 {
+                    (74, 64, 56)
+                } else {
+                    (68, 60, 52)
+                }
+            } else {
+                continue;
+            };
+            buf[idx] = r;
+            buf[idx + 1] = g;
+            buf[idx + 2] = b;
+        }
+    }
+
+    // muzzle flash
+    if flash > 0.02 {
+        let mcx = rw as i64 / 2;
+        let my = gy0;
+        let rad = 1 + (flash * 3.0) as i64;
+        for sy in (my - rad)..=(my + rad) {
+            for sx in (mcx - rad)..=(mcx + rad) {
+                if sx < 0 || sy < 0 || sx >= rw as i64 || sy >= rh as i64 {
+                    continue;
+                }
+                let d = ((sx - mcx).pow(2) + (sy - my).pow(2)) as f64;
+                if d > (rad * rad) as f64 {
+                    continue;
+                }
+                let hot = d < (rad * rad / 3) as f64;
+                let (r, g, b) = if hot {
+                    (255, 244, 190)
+                } else {
+                    (255, 150, 60)
+                };
+                let idx = (sy as usize * rw + sx as usize) * 3;
+                buf[idx] = r;
+                buf[idx + 1] = g;
+                buf[idx + 2] = b;
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// minimap
+// ---------------------------------------------------------------------------
+
+pub struct MiniDot {
+    pub x: f64,
+    pub y: f64,
+    pub r: u8,
+    pub g: u8,
+    pub b: u8,
+}
+
+pub fn draw_minimap(
+    buf: &mut [u8],
+    rw: usize,
+    cam: &Cam,
+    w: &World,
+    dots: &[MiniDot],
+) {
     let mw: usize = 22;
     let mh: usize = 22;
     let ox: usize = 2;
@@ -305,6 +561,20 @@ pub fn draw_minimap(buf: &mut [u8], rw: usize, cam: &Cam, w: &World) {
         buf[idx] = 255;
         buf[idx + 1] = 255;
         buf[idx + 2] = 0;
+    }
+
+    // actor dots
+    for d in dots {
+        let mdx = (d.x - cam.x).round() as i32;
+        let mdy = (d.y - cam.y).round() as i32;
+        let bx = ox as i32 + half_mw as i32 + mdx;
+        let by = oy as i32 + half_mh as i32 + mdy;
+        if bx >= ox as i32 && bx < (ox + mw) as i32 && by >= oy as i32 && by < (oy + mh) as i32 {
+            let idx = (by as usize * rw + bx as usize) * 3;
+            buf[idx] = d.r;
+            buf[idx + 1] = d.g;
+            buf[idx + 2] = d.b;
+        }
     }
 }
 

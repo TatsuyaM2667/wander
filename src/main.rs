@@ -1,5 +1,7 @@
 mod camera;
+mod net;
 mod render;
+mod sim;
 mod ui;
 mod world;
 
