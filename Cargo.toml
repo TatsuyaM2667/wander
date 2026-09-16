@@ -1,0 +1,13 @@
+[package]
+name = "wander"
+version = "0.2.0"
+edition = "2024"
+
+[dependencies]
+terminal-pixel-animation = "0.4"
+ratatui = "0.29"
+crossterm = "0.28"
+
+[profile.release]
+opt-level = 3
+lto = true
