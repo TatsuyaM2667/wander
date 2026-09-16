@@ -12,6 +12,50 @@ pub const K_A: u16 = 1 << 1;
 pub const K_S: u16 = 1 << 2;
 pub const K_D: u16 = 1 << 3;
 
+/// Difficulty level, 1..=10.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct Diff {
+    pub level: i32,
+}
+
+impl Diff {
+    pub fn new(level: i32) -> Self {
+        Self {
+            level: level.clamp(1, 10),
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self.level {
+            1 | 2 => "Casual",
+            3 | 4 => "Easy",
+            5 | 6 => "Normal",
+            7 | 8 => "Hard",
+            _ => "Nightmare",
+        }
+    }
+
+    pub fn enemy_count(self) -> usize {
+        (4 + self.level) as usize
+    }
+
+    pub fn enemy_speed(self) -> f64 {
+        1.0 + self.level as f64 * 0.12
+    }
+
+    pub fn enemy_hp(self) -> f32 {
+        60.0 + self.level as f32 * 14.0
+    }
+
+    pub fn enemy_dmg(self) -> f32 {
+        4.0 + self.level as f32 * 0.8
+    }
+
+    pub fn respawn_s(self) -> f32 {
+        (12.0 - 0.8 * self.level as f32).max(3.0)
+    }
+}
+
 #[derive(Clone, Copy)]
 pub struct PlayerState {
     pub x: f64,
@@ -43,8 +87,8 @@ pub struct Sim {
     pub enemies: Vec<EnemyState>,
     enemy_hp: Vec<f32>,
     atk_cd: Vec<f32>,
-    wander_a: Vec<f64>,
-    wander_cd: Vec<f32>,
+    respawn_t: Vec<f32>,
+    diff: Diff,
     weather: Weather,
     wleft: f32,
     rng: u64,
@@ -53,7 +97,7 @@ pub struct Sim {
 }
 
 impl Sim {
-    pub fn new(seed: u64, theme: Theme) -> Self {
+    pub fn new(seed: u64, theme: Theme, diff: Diff) -> Self {
         let world = World::build(seed, theme);
         let mut s = Self {
             world,
@@ -61,15 +105,15 @@ impl Sim {
             enemies: Vec::new(),
             enemy_hp: Vec::new(),
             atk_cd: Vec::new(),
-            wander_a: Vec::new(),
-            wander_cd: Vec::new(),
+            respawn_t: Vec::new(),
+            diff,
             weather: Weather::Clear,
             wleft: 12.0,
             rng: 0x9E3779B97F4A7C15,
             tick: 0,
             hit_landed: Arc::new(AtomicBool::new(false)),
         };
-        s.spawn_enemies(7);
+        s.spawn_enemies();
         s
     }
 
@@ -110,26 +154,51 @@ impl Sim {
         b == 0 || b == crate::world::I_GRASS || b == crate::world::I_PLAZA
     }
 
-    fn spawn_enemies(&mut self, n: usize) {
-        let mut placed = 0;
-        let mut guard = 0;
-        while placed < n && guard < 2000 {
-            guard += 1;
+    fn enemy_pass(&self, x: f64, y: f64) -> bool {
+        if !free_pos(&self.world, x, y) {
+            return false;
+        }
+        let b = self.world.at(x as i32, y as i32, 1);
+        b == 0 || b == crate::world::I_GRASS || b == crate::world::I_PLAZA
+    }
+
+    fn spawn_enemies(&mut self) {
+        let n = self.diff.enemy_count();
+        for _ in 0..n {
+            self.spawn_one(self.diff.enemy_hp());
+        }
+    }
+
+    fn spawn_one(&mut self, hp: f32) {
+        for _ in 0..500 {
             let x = 5.0 + self.rnd() * (WH as f64 - 10.0);
             let y = 5.0 + self.rnd() * (WH as f64 - 10.0);
-            let d = ((x - 40.0).powi(2) + (y - 40.0).powi(2)).sqrt();
-            if d < 7.0 || !self.clear_at(x, y) {
+            if ((x - 40.0).powi(2) + (y - 40.0).powi(2)).sqrt() < 7.0 || !self.clear_at(x, y) {
                 continue;
             }
             self.enemies.push(EnemyState { x, y, alive: true });
-            self.enemy_hp.push(100.0);
+            self.enemy_hp.push(hp);
             self.atk_cd.push(0.0);
-            let wa = self.rnd() * std::f64::consts::TAU;
-            let wc = 1.0 + (self.rnd() * 4.0) as f32;
-            self.wander_a.push(wa);
-            self.wander_cd.push(wc);
-            placed += 1;
+            self.respawn_t.push(0.0);
+            return;
         }
+    }
+
+    fn respawn_enemy(&mut self, i: usize) {
+        for _ in 0..500 {
+            let x = 5.0 + self.rnd() * (WH as f64 - 10.0);
+            let y = 5.0 + self.rnd() * (WH as f64 - 10.0);
+            if ((x - 40.0).powi(2) + (y - 40.0).powi(2)).sqrt() < 7.0 || !self.clear_at(x, y) {
+                continue;
+            }
+            self.enemies[i].x = x;
+            self.enemies[i].y = y;
+            self.enemies[i].alive = true;
+            self.enemy_hp[i] = self.diff.enemy_hp();
+            self.atk_cd[i] = 0.0;
+            return;
+        }
+        self.respawn_t[i] = 5.0;
     }
 
     fn clear_line(&self, x: f64, y: f64, a: f64, d: f64) -> bool {
@@ -173,6 +242,7 @@ impl Sim {
             if self.enemy_hp[i] <= 0.0 {
                 self.enemies[i].alive = false;
                 self.players[shooter].score += 100;
+                self.respawn_t[i] = self.diff.respawn_s();
             }
             self.hit_landed.store(true, Ordering::Relaxed);
         }
@@ -257,10 +327,13 @@ impl Sim {
             self.wleft = 8.0 + (self.rnd() * 12.0) as f32;
         }
 
-        // enemies: chase when players are close, wander randomly otherwise
-        const AGRO: f64 = 18.0;
+        // enemies: always hunt the nearest living player, respawn after death
         for i in 0..self.enemies.len() {
             if !self.enemies[i].alive {
+                self.respawn_t[i] -= dt as f32;
+                if self.respawn_t[i] <= 0.0 {
+                    self.respawn_enemy(i);
+                }
                 continue;
             }
             // nearest living player
@@ -288,7 +361,7 @@ impl Sim {
                 if self.atk_cd[i] <= 0.0 {
                     self.atk_cd[i] = 1.0;
                     if self.players[tgt].hp > 0.0 {
-                        self.players[tgt].hp -= 8.0;
+                        self.players[tgt].hp -= self.diff.enemy_dmg();
                         if self.players[tgt].hp <= 0.0 {
                             self.players[tgt].hp = 0.0;
                             self.players[tgt].dead_timer = 2.0;
@@ -298,18 +371,8 @@ impl Sim {
                 continue;
             }
 
-            let sp = 1.35 * dt;
-            let (mvx, mvy) = if dist <= AGRO {
-                (ux * sp, uy * sp)
-            } else {
-                self.wander_cd[i] -= dt as f32;
-                if self.wander_cd[i] <= 0.0 {
-                    self.wander_a[i] = self.rnd() * std::f64::consts::TAU;
-                    self.wander_cd[i] = 1.5 + (self.rnd() * 3.5) as f32;
-                }
-                (self.wander_a[i].cos() * sp, self.wander_a[i].sin() * sp)
-            };
-            let (nx, ny) = (ex + mvx, ey + mvy);
+            let sp = self.diff.enemy_speed() * dt;
+            let (nx, ny) = (ex + ux * sp, ey + uy * sp);
             if self.enemy_pass(nx, ey) {
                 self.enemies[i].x = nx;
             } else if self.enemy_pass(ex, ny) {
@@ -319,14 +382,6 @@ impl Sim {
                 self.enemies[i].y = ny;
             }
         }
-    }
-
-    fn enemy_pass(&self, x: f64, y: f64) -> bool {
-        if !free_pos(&self.world, x, y) {
-            return false;
-        }
-        let b = self.world.at(x as i32, y as i32, 1);
-        b == 0 || b == crate::world::I_GRASS || b == crate::world::I_PLAZA
     }
 
     pub fn snapshot(&self) -> Snapshot {

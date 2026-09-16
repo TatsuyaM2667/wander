@@ -14,7 +14,7 @@ use crate::net::{NetClient, spawn_host, DEFAULT_ADDR};
 use crate::render::{
     braille_to_text, decode_halfblock, draw_minimap, render_scene, MiniDot,
 };
-use crate::sim::{EnemyState, PlayerState, Sim, K_A, K_D, K_S, K_W};
+use crate::sim::{Diff, EnemyState, PlayerState, Sim, K_A, K_D, K_S, K_W};
 use crate::world::{Theme, Weather, WORLDS, World};
 
 const SPD: f64 = 4.0;
@@ -37,6 +37,7 @@ enum State {
     Title,
     Mode,
     Select,
+    Diff,
     JoinAddr,
     Play,
 }
@@ -46,6 +47,7 @@ pub struct Game {
     mode: PlayMode,
     mode_sel: usize,
     sel: usize,
+    diff: i32,
 
     // simulation / networking
     sim: Option<Sim>,
@@ -98,6 +100,7 @@ impl Game {
             mode: PlayMode::Single,
             mode_sel: 0,
             sel: 0,
+            diff: 5,
             sim: None,
             net: None,
             my_id: 0,
@@ -195,6 +198,27 @@ impl Game {
                     self.sel = (self.sel + 1) % WORLDS.len();
                 }
                 crossterm::event::KeyCode::Enter => {
+                    self.state = State::Diff;
+                }
+                _ => {}
+            },
+            State::Diff => match code {
+                crossterm::event::KeyCode::Esc | crossterm::event::KeyCode::Char('q') => {
+                    self.state = State::Select;
+                }
+                crossterm::event::KeyCode::Up => {
+                    self.diff = (self.diff - 1).max(1);
+                }
+                crossterm::event::KeyCode::Down => {
+                    self.diff = (self.diff + 1).min(10);
+                }
+                crossterm::event::KeyCode::Left => {
+                    self.diff = (self.diff - 1).max(1);
+                }
+                crossterm::event::KeyCode::Right => {
+                    self.diff = (self.diff + 1).min(10);
+                }
+                crossterm::event::KeyCode::Enter => {
                     self.start_play();
                 }
                 _ => {}
@@ -234,10 +258,11 @@ impl Game {
 
     fn start_play(&mut self) {
         let (_, seed, _, theme) = WORLDS[self.sel];
+        let diff = Diff::new(self.diff);
         self.cur_name = WORLDS[self.sel].0.to_string();
         match self.mode {
             PlayMode::Single => {
-                let mut sim = Sim::new(seed, theme);
+                let mut sim = Sim::new(seed, theme, diff);
                 let my_id = sim.add_player();
                 self.px = sim.players[my_id].x;
                 self.py = sim.players[my_id].y;
@@ -250,7 +275,7 @@ impl Game {
                 self.my_id = my_id;
             }
             PlayMode::Host => {
-                let _ = spawn_host(seed, theme, 4242);
+                let _ = spawn_host(seed, theme, 4242, diff);
                 let mut client =
                     NetClient::connect(&format!("127.0.0.1:{}", 4242)).ok();
                 if let Some(ref mut c) = client {
@@ -665,6 +690,80 @@ impl Game {
         f.render_widget(help, chunks[2]);
     }
 
+    fn draw_diff(&self, f: &mut Frame) {
+        let area = f.area();
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(1),
+                Constraint::Min(12),
+                Constraint::Length(2),
+                Constraint::Length(1),
+            ])
+            .split(area);
+
+        let title = Paragraph::new(Line::from(Span::styled(
+            "  Select Difficulty",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        )));
+        f.render_widget(title, chunks[0]);
+
+        let d = Diff::new(self.diff);
+        let items: Vec<ListItem> = (1..=10)
+            .map(|lv| {
+                let d2 = Diff::new(lv);
+                let selected = lv == self.diff;
+                let style = if selected {
+                    Style::default()
+                        .fg(Color::Green)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(Color::White)
+                };
+                let name = d2.name();
+                let bar_w: usize = lv as usize;
+                let bar = format!(
+                    "{}{}",
+                    "\u{2588}".repeat(bar_w),
+                    "\u{2591}".repeat(10 - bar_w)
+                );
+                ListItem::new(Line::from(vec![
+                    Span::styled(
+                        if selected { " > " } else { "   " },
+                        Style::default().fg(Color::Green),
+                    ),
+                    Span::styled(format!("{:>2} {} ", lv, bar), style),
+                    Span::styled(
+                        format!(
+                            "{}  enemies:{} spd:{:.2} hp:{} dmg:{}",
+                            name,
+                            d2.enemy_count(),
+                            d2.enemy_speed(),
+                            d2.enemy_hp(),
+                            d2.enemy_dmg(),
+                        ),
+                        Style::default().fg(Color::DarkGray),
+                    ),
+                ]))
+            })
+            .collect();
+        let list = List::new(items).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(format!("Difficulty: {} / 10 ({})", d.level, d.name()))
+                .border_style(Style::default().fg(Color::DarkGray)),
+        );
+        f.render_widget(list, chunks[1]);
+
+        let help = Paragraph::new(Line::from(Span::styled(
+            "  [Up/Down] Adjust   [Enter] Start   [Esc] Back",
+            Style::default().fg(Color::DarkGray),
+        )));
+        f.render_widget(help, chunks[2]);
+    }
+
     fn draw_join_addr(&self, f: &mut Frame) {
         let area = f.area();
         let chunks = Layout::default()
@@ -796,8 +895,8 @@ impl Game {
             PlayMode::Host | PlayMode::Join => "MP",
         };
         let hud_text = format!(
-            " {} [{}] {} FPS:{:>2} ({:.1},{:.1}) ",
-            mode_str, wxstr, world_name, self.fps, self.px, self.py
+            " {} [{}] {} DIF:{} FPS:{:>2} ({:.1},{:.1}) ",
+            mode_str, wxstr, world_name, self.diff, self.fps, self.px, self.py
         );
         let hud_w = hud_text.len() as u16;
         if hud_w < area.width {
@@ -901,6 +1000,7 @@ impl Game {
             State::Title => self.draw_title(f),
             State::Mode => self.draw_mode(f),
             State::Select => self.draw_select(f),
+            State::Diff => self.draw_diff(f),
             State::JoinAddr => self.draw_join_addr(f),
             State::Play => self.draw_play(f),
         }

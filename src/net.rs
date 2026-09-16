@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
-use crate::sim::{EnemyState, PlayerState, Sim, Snapshot};
+use crate::sim::{Diff, EnemyState, PlayerState, Sim, Snapshot};
 use crate::world::{Theme, Weather};
 
 pub const DEFAULT_ADDR: &str = "127.0.0.1:4242";
@@ -262,13 +262,13 @@ struct HostConn {
     input: Mutex<Option<(u16, f64, bool)>>,
 }
 
-pub fn spawn_host(seed: u64, theme: Theme, port: u16) -> Result<SocketAddr, String> {
+pub fn spawn_host(seed: u64, theme: Theme, port: u16, diff: Diff) -> Result<SocketAddr, String> {
     let listener = TcpListener::bind(("0.0.0.0", port)).map_err(|e| e.to_string())?;
     let addr = listener.local_addr().map_err(|e| e.to_string())?;
     listener.set_nonblocking(true).map_err(|e| e.to_string())?;
 
     thread::spawn(move || {
-        let mut sim = Sim::new(seed, theme);
+        let mut sim = Sim::new(seed, theme, diff);
         let conns: Arc<Mutex<HashMap<usize, HostConn>>> = Arc::new(Mutex::new(HashMap::new()));
         let mut last_tick = std::time::Instant::now();
         loop {
