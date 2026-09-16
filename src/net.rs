@@ -162,36 +162,48 @@ impl NetClient {
                 };
                 let npl = p[7] as usize;
                 let nen = p[8] as usize;
-                let need = 9 + npl * 20 + nen * 9;
+                // per-player: x,y,angle,hp (4 f32 = 16) + score,kills (2 u32 = 8)
+                //            + dmg_t,dmg_dir (2 f32 = 8)  -> 32 bytes
+                // per-enemy: x,y (8) + alive (1) = 9 bytes
+                // trailing: remaining u32 + complete u8
+                let need = 9 + npl * 32 + nen * 9 + 5;
                 if p.len() < need {
                     return;
                 }
                 let mut players = Vec::with_capacity(npl);
                 for i in 0..npl {
-                    let o = 9 + i * 20;
+                    let o = 9 + i * 32;
                     players.push(PlayerState {
                         x: parse_f32(&p[o..o + 4]) as f64,
                         y: parse_f32(&p[o + 4..o + 8]) as f64,
                         angle: parse_f32(&p[o + 8..o + 12]) as f64,
                         hp: parse_f32(&p[o + 12..o + 16]),
                         score: parse_u32(&p[o + 16..o + 20]),
+                        kills: parse_u32(&p[o + 20..o + 24]),
+                        dmg_t: parse_f32(&p[o + 24..o + 28]),
+                        dmg_dir: parse_f32(&p[o + 28..o + 32]) as f64,
                         dead_timer: 0.0,
                     });
                 }
                 let mut enemies = Vec::with_capacity(nen);
                 for i in 0..nen {
-                    let o = 9 + npl * 20 + i * 9;
+                    let o = 9 + npl * 32 + i * 9;
                     enemies.push(EnemyState {
                         x: parse_f32(&p[o..o + 4]) as f64,
                         y: parse_f32(&p[o + 4..o + 8]) as f64,
                         alive: p[o + 8] != 0,
                     });
                 }
+                let to = 9 + npl * 32 + nen * 9;
+                let remaining = parse_u32(&p[to..to + 4]);
+                let complete = p[to + 4] != 0;
                 state.lock().unwrap().snap = Some(Snapshot {
                     players,
                     enemies,
                     weather,
                     tick: parse_u32(&p[1..5]) as u64,
+                    remaining,
+                    complete,
                 });
             }
             _ => {}
@@ -385,12 +397,17 @@ pub fn spawn_host(seed: u64, theme: Theme, port: u16, diff: Diff) -> Result<Sock
                     le_f32(pl.angle as f32, &mut payload);
                     le_f32(pl.hp, &mut payload);
                     le_u32(pl.score, &mut payload);
+                    le_u32(pl.kills, &mut payload);
+                    le_f32(pl.dmg_t, &mut payload);
+                    le_f32(pl.dmg_dir as f32, &mut payload);
                 }
                 for e in &snap.enemies {
                     le_f32(e.x as f32, &mut payload);
                     le_f32(e.y as f32, &mut payload);
                     payload.push(e.alive as u8);
                 }
+                le_u32(snap.remaining, &mut payload);
+                payload.push(snap.complete as u8);
                 let enc = encode_packet(&payload);
                 let mut locked = conns.lock().unwrap();
                 locked.retain(|_, c| c.stream.write_all(&enc).is_ok());

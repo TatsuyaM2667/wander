@@ -12,7 +12,8 @@ use terminal_pixel_animation::render_half_block;
 use crate::camera::{Cam, free_pos, FOV};
 use crate::net::{NetClient, spawn_host, DEFAULT_ADDR};
 use crate::render::{
-    braille_to_text, decode_halfblock, draw_minimap, render_scene, MiniDot,
+    braille_to_text, decode_halfblock, draw_damage_indicator, draw_minimap,
+    render_scene, MiniDot,
 };
 use crate::sim::{Diff, EnemyState, PlayerState, Sim, K_A, K_D, K_S, K_W};
 use crate::world::{Theme, Weather, WORLDS, World};
@@ -40,6 +41,7 @@ enum State {
     Diff,
     JoinAddr,
     Play,
+    Result,
 }
 
 pub struct Game {
@@ -62,9 +64,15 @@ pub struct Game {
     p_angle: f64,
     p_hp: f32,
     p_score: u32,
+    p_kills: u32,
     weather: Weather,
     enemy_snapshot: Vec<EnemyState>,
     player_snapshot: Vec<PlayerState>,
+    remaining: u32,
+    complete: bool,
+    dmg_dir: f64,
+    dmg_t: f32,
+    result_timer: f32,
 
     // input
     angle: f64,
@@ -111,9 +119,15 @@ impl Game {
             p_angle: 0.0,
             p_hp: 100.0,
             p_score: 0,
+            p_kills: 0,
             weather: Weather::Clear,
             enemy_snapshot: Vec::new(),
             player_snapshot: Vec::new(),
+            remaining: 0,
+            complete: false,
+            dmg_dir: 0.0,
+            dmg_t: 0.0,
+            result_timer: 0.0,
             angle: 0.0,
             wants_shoot: false,
             shoot_cd: 0.0,
@@ -253,6 +267,25 @@ impl Game {
                 }
                 _ => {}
             },
+            State::Result => match code {
+                crossterm::event::KeyCode::Esc | crossterm::event::KeyCode::Char('q') => {
+                    self.net = None;
+                    self.net_world = None;
+                    self.sim = None;
+                    self.result_timer = 0.0;
+                    self.complete = false;
+                    self.state = State::Title;
+                }
+                crossterm::event::KeyCode::Enter | crossterm::event::KeyCode::Char(' ') => {
+                    self.net = None;
+                    self.net_world = None;
+                    self.sim = None;
+                    self.result_timer = 0.0;
+                    self.complete = false;
+                    self.state = State::Title;
+                }
+                _ => {}
+            },
         }
     }
 
@@ -307,8 +340,13 @@ impl Game {
         self.held.clear();
         self.p_hp = 100.0;
         self.p_score = 0;
+        self.p_kills = 0;
         self.enemy_snapshot.clear();
         self.player_snapshot.clear();
+        self.remaining = 0;
+        self.complete = false;
+        self.result_timer = 0.0;
+        self.dmg_t = 0.0;
         self.last = Instant::now();
         self.flash = 0.0;
         self.cam.set_angle(self.angle);
@@ -364,6 +402,19 @@ impl Game {
         let now = Instant::now();
         let dt = (now - self.last).as_secs_f64().min(0.1);
         self.last = now;
+
+        if self.state == State::Result {
+            self.result_timer += dt as f32;
+            if self.result_timer > 5.0 {
+                self.net = None;
+                self.net_world = None;
+                self.sim = None;
+                self.result_timer = 0.0;
+                self.complete = false;
+                self.state = State::Title;
+            }
+            return;
+        }
 
         if self.state != State::Play {
             return;
@@ -441,6 +492,11 @@ impl Game {
                     self.py = p.y;
                     self.p_hp = p.hp;
                     self.p_score = p.score;
+                    self.p_kills = p.kills;
+                    self.dmg_dir = p.dmg_dir;
+                    self.dmg_t = p.dmg_t;
+                    self.remaining = sim.remaining;
+                    self.complete = sim.complete;
                     self.weather = sim.snapshot().weather;
                     self.enemy_snapshot = sim.enemies.clone();
                 }
@@ -497,6 +553,8 @@ impl Game {
                         self.weather = snap.weather;
                         self.enemy_snapshot = snap.enemies.clone();
                         self.player_snapshot = snap.players.clone();
+                        self.remaining = snap.remaining;
+                        self.complete = snap.complete;
                         if let Some(my) = snap.players.get(self.my_id) {
                             let dx = my.x - self.px;
                             let dy = my.y - self.py;
@@ -509,6 +567,9 @@ impl Game {
                             }
                             self.p_hp = my.hp;
                             self.p_score = my.score;
+                            self.p_kills = my.kills;
+                            self.dmg_dir = my.dmg_dir;
+                            self.dmg_t = my.dmg_t;
                         }
                     }
                 }
@@ -518,6 +579,17 @@ impl Game {
         self.cam.x = self.px;
         self.cam.y = self.py;
         self.cam.set_angle(self.angle);
+
+        if self.complete && self.result_timer == 0.0 {
+            self.result_timer = 1.5;
+        }
+        if self.result_timer > 0.0 && self.state == State::Play {
+            self.result_timer -= dt as f32;
+            if self.result_timer <= 0.0 {
+                self.state = State::Result;
+                self.result_timer = 0.0;
+            }
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -811,13 +883,14 @@ impl Game {
         let area = f.area();
         let rw = self.render_w as usize;
         let rh = self.render_h as usize;
-        let (w, pal): (&World, crate::world::Palette) = if let Some(ref s) = self.sim {
-            (&s.world, s.world.theme.palette())
-        } else if let Some(ref nw) = self.net_world {
-            (nw, nw.theme.palette())
-        } else {
-            return;
-        };
+        let (w, pal, particles): (&World, crate::world::Palette, &[crate::sim::Particle]) =
+            if let Some(ref s) = self.sim {
+                (&s.world, s.world.theme.palette(), &s.particles)
+            } else if let Some(ref nw) = self.net_world {
+                (nw, nw.theme.palette(), &[])
+            } else {
+                return;
+            };
         let cam = self.cam;
         let weather = self.weather;
         let anim = self.anim;
@@ -837,6 +910,7 @@ impl Game {
                 anim,
                 &self.player_snapshot,
                 &self.enemy_snapshot,
+                particles,
                 my_id,
                 flash,
             );
@@ -867,6 +941,7 @@ impl Game {
                 });
             }
             draw_minimap(pbuf, rw, &cam, w, &dots);
+            draw_damage_indicator(pbuf, rw, rh, self.dmg_dir, self.angle, self.dmg_t);
         }
 
         let cells = render_half_block(
@@ -895,8 +970,8 @@ impl Game {
             PlayMode::Host | PlayMode::Join => "MP",
         };
         let hud_text = format!(
-            " {} [{}] {} DIF:{} FPS:{:>2} ({:.1},{:.1}) ",
-            mode_str, wxstr, world_name, self.diff, self.fps, self.px, self.py
+            " {} [{}] {} DIF:{} ENEMIES:{} FPS:{:>2} ",
+            mode_str, wxstr, world_name, self.diff, self.remaining, self.fps
         );
         let hud_w = hud_text.len() as u16;
         if hud_w < area.width {
@@ -934,7 +1009,8 @@ impl Game {
             "\u{2588}".repeat(filled),
             "\u{2591}".repeat(bar_full - filled),
         );
-        let hp_text = format!("{}{}", bar, self.p_score);
+        let total_enemies = self.p_kills + self.remaining;
+        let hp_text = format!("{}{} KILLS:{}/{}", bar, self.p_score, self.p_kills, total_enemies);
         let hp_w = hp_text.len() as u16;
         if hp_w < area.width {
             let hp_area = ratatui::layout::Rect {
@@ -993,6 +1069,83 @@ impl Game {
             };
             f.render_widget(msg, da);
         }
+
+        // complete overlay
+        if self.complete {
+            let msg = Paragraph::new(Line::from(Span::styled(
+                "  ALL ENEMIES ELIMINATED - COMPLETE! ",
+                Style::default()
+                    .fg(Color::Green)
+                    .add_modifier(Modifier::BOLD)
+                    .bg(Color::Rgb(10, 10, 20)),
+            )))
+            .alignment(Alignment::Center);
+            let da = ratatui::layout::Rect {
+                x: area.x + area.width / 2 - 21,
+                y: area.y + area.height / 2,
+                width: 42,
+                height: 1,
+            };
+            f.render_widget(msg, da);
+        }
+    }
+
+    fn draw_result(&self, f: &mut Frame) {
+        let area = f.area();
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Percentage(30),
+                Constraint::Percentage(40),
+                Constraint::Percentage(30),
+            ])
+            .split(area);
+        let block = Block::default()
+            .title(" RESULTS ")
+            .borders(Borders::ALL)
+            .style(Style::default().fg(Color::Cyan));
+        let lines = vec![
+            Line::from(Span::styled(
+                "  MISSION COMPLETE!  ",
+                Style::default()
+                    .fg(Color::Green)
+                    .add_modifier(Modifier::BOLD),
+            )),
+            Line::from(""),
+            Line::from(vec![
+                Span::styled("  Score: ", Style::default().fg(Color::White)),
+                Span::styled(
+                    format!("{}", self.p_score),
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                ),
+            ]),
+            Line::from(vec![
+                Span::styled("  Kills: ", Style::default().fg(Color::White)),
+                Span::styled(
+                    format!("{}", self.p_kills),
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                ),
+            ]),
+            Line::from(""),
+            Line::from(Span::styled(
+                "  Press any key to return to title  ",
+                Style::default().fg(Color::DarkGray),
+            )),
+        ];
+        let para = Paragraph::new(lines)
+            .block(block)
+            .alignment(Alignment::Center);
+        let res_area = ratatui::layout::Rect {
+            x: chunks[1].x + chunks[1].width / 4,
+            y: chunks[1].y,
+            width: chunks[1].width / 2,
+            height: chunks[1].height,
+        };
+        f.render_widget(para, res_area);
     }
 
     pub fn draw(&mut self, f: &mut Frame) {
@@ -1003,6 +1156,7 @@ impl Game {
             State::Diff => self.draw_diff(f),
             State::JoinAddr => self.draw_join_addr(f),
             State::Play => self.draw_play(f),
+            State::Result => self.draw_result(f),
         }
     }
 }

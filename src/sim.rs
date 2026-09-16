@@ -50,10 +50,6 @@ impl Diff {
     pub fn enemy_dmg(self) -> f32 {
         4.0 + self.level as f32 * 0.8
     }
-
-    pub fn respawn_s(self) -> f32 {
-        (12.0 - 0.8 * self.level as f32).max(3.0)
-    }
 }
 
 #[derive(Clone, Copy)]
@@ -63,7 +59,10 @@ pub struct PlayerState {
     pub angle: f64,
     pub hp: f32,
     pub score: u32,
+    pub kills: u32,
     pub dead_timer: f32,
+    pub dmg_dir: f64,
+    pub dmg_t: f32,
 }
 
 #[derive(Clone, Copy)]
@@ -73,12 +72,26 @@ pub struct EnemyState {
     pub alive: bool,
 }
 
+#[derive(Clone, Copy)]
+pub struct Particle {
+    pub x: f64,
+    pub y: f64,
+    pub vz: f64,
+    pub vx: f64,
+    pub vy: f64,
+    pub z: f64,
+    pub life: f32,
+    pub kind: u8,
+}
+
 #[derive(Clone)]
 pub struct Snapshot {
     pub players: Vec<PlayerState>,
     pub enemies: Vec<EnemyState>,
     pub weather: Weather,
     pub tick: u64,
+    pub remaining: u32,
+    pub complete: bool,
 }
 
 pub struct Sim {
@@ -87,7 +100,9 @@ pub struct Sim {
     pub enemies: Vec<EnemyState>,
     enemy_hp: Vec<f32>,
     atk_cd: Vec<f32>,
-    respawn_t: Vec<f32>,
+    pub remaining: u32,
+    pub complete: bool,
+    pub particles: Vec<Particle>,
     diff: Diff,
     weather: Weather,
     wleft: f32,
@@ -105,7 +120,9 @@ impl Sim {
             enemies: Vec::new(),
             enemy_hp: Vec::new(),
             atk_cd: Vec::new(),
-            respawn_t: Vec::new(),
+            remaining: 0,
+            complete: false,
+            particles: Vec::new(),
             diff,
             weather: Weather::Clear,
             wleft: 12.0,
@@ -126,7 +143,10 @@ impl Sim {
             angle: 0.0,
             hp: MAX_HP,
             score: 0,
+            kills: 0,
             dead_timer: 0.0,
+            dmg_dir: 0.0,
+            dmg_t: 0.0,
         });
         n
     }
@@ -163,10 +183,12 @@ impl Sim {
     }
 
     fn spawn_enemies(&mut self) {
-        let n = self.diff.enemy_count();
-        for _ in 0..n {
+        let mut count: u32 = 0;
+        for _ in 0..self.diff.enemy_count() {
             self.spawn_one(self.diff.enemy_hp());
+            count += 1;
         }
+        self.remaining = count;
     }
 
     fn spawn_one(&mut self, hp: f32) {
@@ -179,26 +201,8 @@ impl Sim {
             self.enemies.push(EnemyState { x, y, alive: true });
             self.enemy_hp.push(hp);
             self.atk_cd.push(0.0);
-            self.respawn_t.push(0.0);
             return;
         }
-    }
-
-    fn respawn_enemy(&mut self, i: usize) {
-        for _ in 0..500 {
-            let x = 5.0 + self.rnd() * (WH as f64 - 10.0);
-            let y = 5.0 + self.rnd() * (WH as f64 - 10.0);
-            if ((x - 40.0).powi(2) + (y - 40.0).powi(2)).sqrt() < 7.0 || !self.clear_at(x, y) {
-                continue;
-            }
-            self.enemies[i].x = x;
-            self.enemies[i].y = y;
-            self.enemies[i].alive = true;
-            self.enemy_hp[i] = self.diff.enemy_hp();
-            self.atk_cd[i] = 0.0;
-            return;
-        }
-        self.respawn_t[i] = 5.0;
     }
 
     fn clear_line(&self, x: f64, y: f64, a: f64, d: f64) -> bool {
@@ -213,6 +217,33 @@ impl Sim {
             t += 0.3;
         }
         true
+    }
+
+    fn burst_particles(&mut self, x: f64, y: f64, n: usize, speed: f64, kind: u8) {
+        for _ in 0..n {
+            if self.particles.len() >= 512 {
+                return;
+            }
+            let r = self.rnd();
+            let r2 = self.rnd();
+            let angle = r * std::f64::consts::TAU;
+            let v = speed * (0.2 + r2);
+            let vz = 1.0 + self.rnd() * 2.5;
+            let z = 0.3 + self.rnd() * 0.7;
+            let life = 0.35 + self.rnd() as f32 * 0.6;
+            let vx = angle.cos() * v;
+            let vy = angle.sin() * v;
+            self.particles.push(Particle {
+                x,
+                y,
+                vz,
+                vx,
+                vy,
+                z,
+                life,
+                kind,
+            });
+        }
     }
 
     fn shoot(&mut self, shooter: usize) {
@@ -239,10 +270,19 @@ impl Sim {
         }
         if let Some((_, i)) = best {
             self.enemy_hp[i] -= 34.0;
+            let ex = self.enemies[i].x;
+            let ey = self.enemies[i].y;
+            self.burst_particles(ex, ey, 3, 90.0, 0);
             if self.enemy_hp[i] <= 0.0 {
                 self.enemies[i].alive = false;
                 self.players[shooter].score += 100;
-                self.respawn_t[i] = self.diff.respawn_s();
+                self.players[shooter].kills += 1;
+                self.burst_particles(ex, ey, 18, 240.0, 0);
+                self.burst_particles(ex, ey, 6, 320.0, 1);
+                self.remaining = self.remaining.saturating_sub(1);
+                if self.remaining == 0 {
+                    self.complete = true;
+                }
             }
             self.hit_landed.store(true, Ordering::Relaxed);
         }
@@ -301,6 +341,31 @@ impl Sim {
     pub fn tick(&mut self, dt: f64) {
         self.tick += 1;
 
+        for p in self.players.iter_mut() {
+            if p.dmg_t > 0.0 {
+                p.dmg_t -= dt as f32;
+            }
+            if p.dmg_t < 0.0 {
+                p.dmg_t = 0.0;
+            }
+        }
+
+        // particles (blood/gib spray)
+        for pt in self.particles.iter_mut() {
+            pt.life -= dt as f32;
+            pt.x += pt.vx * dt;
+            pt.y += pt.vy * dt;
+            pt.z += pt.vz * dt;
+            pt.vx *= 0.86;
+            pt.vy *= 0.86;
+            pt.vz -= 6.0 * dt;
+            if pt.z < 0.15 {
+                pt.z = 0.15;
+                pt.vz = -pt.vz * 0.3;
+            }
+        }
+        self.particles.retain(|p| p.life > 0.0);
+
         // weather
         self.wleft -= dt as f32;
         if self.wleft <= 0.0 {
@@ -327,13 +392,9 @@ impl Sim {
             self.wleft = 8.0 + (self.rnd() * 12.0) as f32;
         }
 
-        // enemies: always hunt the nearest living player, respawn after death
+        // enemies: always hunt the nearest living player
         for i in 0..self.enemies.len() {
             if !self.enemies[i].alive {
-                self.respawn_t[i] -= dt as f32;
-                if self.respawn_t[i] <= 0.0 {
-                    self.respawn_enemy(i);
-                }
                 continue;
             }
             // nearest living player
@@ -362,6 +423,8 @@ impl Sim {
                     self.atk_cd[i] = 1.0;
                     if self.players[tgt].hp > 0.0 {
                         self.players[tgt].hp -= self.diff.enemy_dmg();
+                        self.players[tgt].dmg_dir = (ey - self.players[tgt].y).atan2(ex - self.players[tgt].x);
+                        self.players[tgt].dmg_t = 1.5;
                         if self.players[tgt].hp <= 0.0 {
                             self.players[tgt].hp = 0.0;
                             self.players[tgt].dead_timer = 2.0;
@@ -390,6 +453,8 @@ impl Sim {
             enemies: self.enemies.clone(),
             weather: self.weather,
             tick: self.tick,
+            remaining: self.remaining,
+            complete: self.complete,
         }
     }
 }
